@@ -1,0 +1,76 @@
+load("@apex//tools/bazel/rules_ros_pkg:defs.bzl", "ros_pkg")
+
+cc_library(
+    name = "aws_c_io",
+    srcs = select({
+        "@platforms//os:linux": glob(
+            [
+                "source/**/*.c",
+                "source/**/*.h",
+            ],
+            exclude = [
+                "source/windows/**/*.c",
+                "source/bsd/*.c",
+                "source/darwin/*.c",
+                "source/qnx/*.c",
+            ],
+        ),
+        "@platforms//os:qnx": glob(
+            [
+                "source/**/*.c",
+                "source/**/*.h",
+            ],
+            exclude = [
+                "source/windows/**/*.c",
+                "source/bsd/*.c",
+                "source/darwin/*.c",
+                "source/linux/epoll_event_loop.c",
+            ],
+        ),
+    }),
+    hdrs = glob(
+        [
+            "include/aws/**/*.h",
+        ],
+    ),
+    defines = ["USE_S2N=1"],
+    includes = ["."],
+    strip_include_prefix = "include",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@aws_c_cal",
+        "@aws_c_common",
+        "@s2n_tls",
+    ],
+)
+
+ros_pkg(
+    name = "aws_c_io_pkg",
+    bst_substitute_with = select({
+        "@apex//common/build_system_transfer:use_cmake_find_package": {
+            "name": "aws-c-io",
+            "cmake_find_package": """\
+find_package(aws-c-io REQUIRED)
+if (NOT TARGET {pkg_name}::aws_c_io)
+    add_library({pkg_name}::aws_c_io ALIAS AWS::aws-c-io)
+endif()
+""",
+        },
+        "//conditions:default": {
+        },
+    }),
+    cc_libraries = [":aws_c_io"],
+    description = "This is a module for the AWS SDK for C. It handles all IO and TLS work for " +
+                  "application protocols.",
+    license = "Apex.AI Proprietary License",
+    maintainer_email = "support@apex.ai",
+    maintainer_name = "Apex.AI",
+    pkg_name = "aws_c_io_vendor",
+    version = "0.14.7",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@aws_c_cal//:aws_c_cal_pkg",
+        "@aws_c_common//:aws_c_common_pkg",
+        "@s2n_tls//:s2n_tls_pkg",
+    ],
+)
