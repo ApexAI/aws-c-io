@@ -570,23 +570,8 @@ done:
 }
 
 static bool s_compare_serial_numbers(CFDataRef a, CFDataRef b) {
-    CFIndex a_len = CFDataGetLength(a);
-    CFIndex b_len = CFDataGetLength(b);
-
-    if (a_len != b_len) {
-        return false;
-    }
-
-    const uint8_t *a_bytes = CFDataGetBytePtr(a);
-    const uint8_t *b_bytes = CFDataGetBytePtr(b);
-
-    for (CFIndex i = 0; i < a_len; ++i) {
-        if (a_bytes[i] != b_bytes[i]) {
-            return false;
-        }
-    }
-
-    return true;
+    return CFDataGetLength(a) == CFDataGetLength(b) &&
+           memcmp(CFDataGetBytePtr(a), CFDataGetBytePtr(b), MIN(CFDataGetLength(a), CFDataGetLength(b))) == 0;
 }
 
 static int s_aws_secitem_get_identity(
@@ -616,10 +601,10 @@ static int s_aws_secitem_get_identity(
     CFDictionaryAddValue(search_query, kSecMatchLimit, kSecMatchLimitAll);
     /* Return only identities that match user-provided certificate. */
     CFArrayRef cert_filter = CFArrayCreate(cf_alloc, (const void **)&cert_ref, 1L, &kCFTypeArrayCallBacks);
+    CFDictionaryAddValue(search_query, kSecMatchItemList, cert_filter);
 
     // TODO Add filter for a certain keychain: default (login) or the one provided by user.
 
-    CFDictionaryAddValue(search_query, kSecMatchItemList, cert_filter);
     CFDictionaryAddValue(search_query, kSecUseDataProtectionKeychain, kCFBooleanFalse);
 
     /*
