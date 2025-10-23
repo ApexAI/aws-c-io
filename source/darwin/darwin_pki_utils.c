@@ -381,6 +381,7 @@ static int s_aws_secitem_add_certificate_to_keychain(
     CFDictionaryAddValue(add_attributes, kSecAttrSerialNumber, serial_data);
     CFDictionaryAddValue(add_attributes, kSecAttrLabel, label);
     CFDictionaryAddValue(add_attributes, kSecValueRef, cert_ref);
+    CFDictionaryAddValue(add_attributes, kSecUseDataProtectionKeychain, kCFBooleanFalse);
 
     // Initial attempt to add certificate to keychain.
     status = SecItemAdd(add_attributes, NULL);
@@ -435,6 +436,7 @@ static int s_aws_secitem_add_certificate_to_keychain(
             CFDictionaryCreateMutable(cf_alloc, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         CFDictionaryAddValue(delete_query, kSecClass, kSecClassCertificate);
         CFDictionaryAddValue(delete_query, kSecAttrSerialNumber, serial_data);
+        CFDictionaryAddValue(delete_query, kSecUseDataProtectionKeychain, kCFBooleanFalse);
 
         // delete the existing certificate from keychain
         status = SecItemDelete(delete_query);
@@ -483,6 +485,7 @@ static int s_aws_secitem_add_private_key_to_keychain(
     CFDictionaryAddValue(add_attributes, kSecAttrApplicationLabel, application_label);
     CFDictionaryAddValue(add_attributes, kSecAttrLabel, label);
     CFDictionaryAddValue(add_attributes, kSecValueRef, key_ref);
+    CFDictionaryAddValue(add_attributes, kSecUseDataProtectionKeychain, kCFBooleanFalse);
 
     // Initial attempt to add private key to keychain.
     status = SecItemAdd(add_attributes, NULL);
@@ -535,6 +538,7 @@ static int s_aws_secitem_add_private_key_to_keychain(
         CFDictionaryAddValue(delete_query, kSecClass, kSecClassKey);
         CFDictionaryAddValue(delete_query, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
         CFDictionaryAddValue(delete_query, kSecAttrApplicationLabel, application_label);
+        CFDictionaryAddValue(delete_query, kSecUseDataProtectionKeychain, kCFBooleanFalse);
 
         // delete the existing private key from keychain
         status = SecItemDelete(delete_query);
@@ -565,12 +569,36 @@ done:
     return result;
 }
 
-static int s_aws_secitem_get_identity(CFAllocatorRef cf_alloc, CFDataRef serial_data, sec_identity_t *out_identity) {
+static bool s_compare_serial_numbers(CFDataRef a, CFDataRef b) {
+    CFIndex a_len = CFDataGetLength(a);
+    CFIndex b_len = CFDataGetLength(b);
+
+    if (a_len != b_len) {
+        return false;
+    }
+
+    const uint8_t *a_bytes = CFDataGetBytePtr(a);
+    const uint8_t *b_bytes = CFDataGetBytePtr(b);
+
+    for (CFIndex i = 0; i < a_len; ++i) {
+        if (a_bytes[i] != b_bytes[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static int s_aws_secitem_get_identity(
+    CFAllocatorRef cf_alloc,
+    CFDataRef serial_data,
+    SecCertificateRef cert_ref,
+    sec_identity_t *out_identity) {
 
     int result = AWS_OP_ERR;
     OSStatus status;
     CFMutableDictionaryRef search_query = NULL;
-    SecIdentityRef sec_identity_ref = NULL;
+    CFArrayRef sec_identity_array = NULL;
 
     /*
      * SecItem identity is created when a certificate matches a private key in the keychain.
@@ -583,12 +611,22 @@ static int s_aws_secitem_get_identity(CFAllocatorRef cf_alloc, CFDataRef serial_
     CFDictionaryAddValue(search_query, kSecClass, kSecClassIdentity);
     CFDictionaryAddValue(search_query, kSecAttrSerialNumber, serial_data);
     CFDictionaryAddValue(search_query, kSecReturnRef, kCFBooleanTrue);
+    /* Request for all matched identities. SecItemCopyMatching on macOS can return extra identities, so we're filtering
+     * them out manually using serial_data. */
+    CFDictionaryAddValue(search_query, kSecMatchLimit, kSecMatchLimitAll);
+    /* Return only identities that match user-provided certificate. */
+    CFArrayRef cert_filter = CFArrayCreate(cf_alloc, (const void **)&cert_ref, 1L, &kCFTypeArrayCallBacks);
+
+    // TODO Add filter for a certain keychain: default (login) or the one provided by user.
+
+    CFDictionaryAddValue(search_query, kSecMatchItemList, cert_filter);
+    CFDictionaryAddValue(search_query, kSecUseDataProtectionKeychain, kCFBooleanFalse);
 
     /*
      * Copied or created CF items must have CFRelease called on them or you leak memory. This identity needs to
      * have CFRelease called on it at some point or it will leak.
      */
-    status = SecItemCopyMatching(search_query, (CFTypeRef *)&sec_identity_ref);
+    status = SecItemCopyMatching(search_query, (CFTypeRef *)&sec_identity_array);
 
     if (status != errSecSuccess) {
         AWS_LOGF_ERROR(AWS_LS_IO_PKI, "SecItemCopyMatching identity failed with OSStatus %d", (int)status);
@@ -596,22 +634,45 @@ static int s_aws_secitem_get_identity(CFAllocatorRef cf_alloc, CFDataRef serial_
         goto done;
     }
 
-    *out_identity = sec_identity_create(sec_identity_ref);
-    if (*out_identity == NULL) {
-        AWS_LOGF_ERROR(
-            AWS_LS_IO_PKI, "sec_identity_create failed to create a sec_identity_t from provided SecIdentityRef.");
-        aws_raise_error(AWS_ERROR_SYS_CALL_FAILURE);
-        goto done;
+    CFIndex identity_num = CFArrayGetCount(sec_identity_array);
+    AWS_LOGF_DEBUG(AWS_LS_IO_PKI, "Found %d identities", (int)identity_num);
+
+    for (CFIndex i = 0; i < identity_num; i++) {
+        SecIdentityRef sec_identity_ref = CFArrayGetValueAtIndex(sec_identity_array, i);
+
+        SecCertificateRef found_cert = NULL;
+        OSStatus copy_cert_status = SecIdentityCopyCertificate(sec_identity_ref, &found_cert);
+        if (copy_cert_status != errSecSuccess) {
+            AWS_LOGF_ERROR(AWS_LS_IO_PKI, "SecIdentityCopyCertificate failed with OSStatus %d", (int)copy_cert_status);
+            aws_raise_error(AWS_ERROR_SYS_CALL_FAILURE);
+            goto done;
+        }
+
+        CFDataRef found_cert_serial_data = SecCertificateCopySerialNumber(found_cert, NULL);
+
+        if (s_compare_serial_numbers(serial_data, found_cert_serial_data)) {
+            AWS_LOGF_TRACE(AWS_LS_IO_PKI, "Found a matching identity");
+            *out_identity = sec_identity_create(sec_identity_ref);
+            if (*out_identity == NULL) {
+                AWS_LOGF_ERROR(
+                    AWS_LS_IO_PKI, "sec_identity_create failed to create a sec_identity_t from provided SecIdentityRef.");
+                aws_raise_error(AWS_ERROR_SYS_CALL_FAILURE);
+                goto done;
+            }
+
+            break;
+        }
     }
 
     AWS_LOGF_INFO(AWS_LS_IO_PKI, "static: Successfully retrieved identity from keychain.");
-
     result = AWS_OP_SUCCESS;
 
 done:
     // cleanup
     aws_cf_release(search_query);
-    aws_cf_release(sec_identity_ref);
+    aws_cf_release(cert_filter);
+    // TODO Release elements.
+    aws_cf_release(sec_identity_array);
 
     return result;
 }
@@ -774,6 +835,8 @@ int aws_secitem_import_cert_and_key(
         CFDictionaryCreateMutable(cf_alloc, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     CFDictionaryAddValue(key_attributes, kSecAttrKeyClass, kSecAttrKeyClassPrivate);
     CFDictionaryAddValue(key_attributes, kSecAttrKeyType, key_type);
+    CFDictionaryAddValue(key_attributes, kSecUseDataProtectionKeychain, kCFBooleanFalse);
+
     key_ref = SecKeyCreateWithData(key_data, key_attributes, &error);
 
     // Get the hash of the public key stored within the private key by extracting it from the key_ref's attributes
@@ -808,7 +871,7 @@ int aws_secitem_import_cert_and_key(
         goto done;
     }
 
-    if (s_aws_secitem_get_identity(cf_alloc, cert_serial_data, secitem_identity)) {
+    if (s_aws_secitem_get_identity(cf_alloc, cert_serial_data, cert_ref, secitem_identity)) {
         goto done;
     }
 
