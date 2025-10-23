@@ -638,7 +638,7 @@ static int s_aws_secitem_get_identity(
     AWS_LOGF_DEBUG(AWS_LS_IO_PKI, "Found %d identities", (int)identity_num);
 
     for (CFIndex i = 0; i < identity_num; i++) {
-        SecIdentityRef sec_identity_ref = CFArrayGetValueAtIndex(sec_identity_array, i);
+        const SecIdentityRef sec_identity_ref = CFArrayGetValueAtIndex(sec_identity_array, i);
 
         SecCertificateRef found_cert = NULL;
         OSStatus copy_cert_status = SecIdentityCopyCertificate(sec_identity_ref, &found_cert);
