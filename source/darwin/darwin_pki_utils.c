@@ -655,7 +655,8 @@ static int s_aws_secitem_get_identity(
             *out_identity = sec_identity_create(sec_identity_ref);
             if (*out_identity == NULL) {
                 AWS_LOGF_ERROR(
-                    AWS_LS_IO_PKI, "sec_identity_create failed to create a sec_identity_t from provided SecIdentityRef.");
+                    AWS_LS_IO_PKI,
+                    "sec_identity_create failed to create a sec_identity_t from provided SecIdentityRef.");
                 aws_raise_error(AWS_ERROR_SYS_CALL_FAILURE);
                 goto done;
             }
