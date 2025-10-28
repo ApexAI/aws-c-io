@@ -1108,6 +1108,8 @@ struct socks5_bootstrap_stub_context {
     uint16_t port;
     void *user_data;
     const struct aws_tls_connection_options *tls_options;
+    struct aws_allocator *allocator;
+    struct aws_string *host_name_copy;
 };
 
 static struct socks5_bootstrap_stub_context *s_stub_context = NULL;
@@ -1120,6 +1122,20 @@ static int s_stub_bootstrap_new_socket_channel(struct aws_socket_channel_bootstr
         s_stub_context->port = options->port;
         s_stub_context->user_data = options->user_data;
         s_stub_context->tls_options = options->tls_options;
+        if (s_stub_context->host_name_copy) {
+            aws_string_destroy(s_stub_context->host_name_copy);
+            s_stub_context->host_name_copy = NULL;
+        }
+        if (s_stub_context->allocator && options->host_name) {
+            /* Copy the proxy host so later assertions never touch channel_options memory that may be cleaned up */
+            s_stub_context->host_name_copy =
+                aws_string_new_from_c_str(s_stub_context->allocator, options->host_name);
+            if (s_stub_context->host_name_copy) {
+                s_stub_context->host_name = aws_string_c_str(s_stub_context->host_name_copy);
+            } else {
+                s_stub_context->host_name = NULL;
+            }
+        }
     }
     aws_raise_error(AWS_ERROR_UNKNOWN);
     return AWS_OP_ERR;
@@ -1161,6 +1177,7 @@ static int s_socks5_bootstrap_system_vtable_failure(struct aws_allocator *alloca
 
     struct socks5_bootstrap_stub_context stub_context;
     AWS_ZERO_STRUCT(stub_context);
+    stub_context.allocator = allocator;
     s_stub_context = &stub_context;
 
     struct aws_socks5_system_vtable stub_vtable = {
@@ -1173,9 +1190,10 @@ static int s_socks5_bootstrap_system_vtable_failure(struct aws_allocator *alloca
         aws_client_bootstrap_new_socket_channel_with_socks5(allocator, &channel_options, &proxy_options));
 
     ASSERT_TRUE(stub_context.invoked);
-    ASSERT_STR_EQUALS("proxy.local", stub_context.host_name);
     ASSERT_INT_EQUALS(1080, stub_context.port);
     ASSERT_NOT_NULL(stub_context.user_data);
+    ASSERT_NOT_NULL(stub_context.host_name_copy);
+    ASSERT_STR_EQUALS("proxy.local", aws_string_c_str(stub_context.host_name_copy));
     ASSERT_NULL(stub_context.tls_options);
 
     aws_socks5_channel_handler_set_system_vtable(NULL);
@@ -1187,6 +1205,7 @@ static int s_socks5_bootstrap_system_vtable_failure(struct aws_allocator *alloca
     aws_event_loop_group_release(el_group);
 
     aws_io_library_clean_up();
+    aws_string_destroy(stub_context.host_name_copy);
 
     return AWS_OP_SUCCESS;
 }
