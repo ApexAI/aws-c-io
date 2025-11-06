@@ -5,6 +5,8 @@
 #include <aws/io/tls_channel_handler.h>
 
 #include <aws/common/clock.h>
+#include <aws/common/encoding.h>
+#include <aws/common/environment.h>
 #include <aws/common/mutex.h>
 
 #include <aws/io/channel.h>
@@ -40,6 +42,8 @@ struct s2n_delayed_shutdown_task {
     struct aws_channel_slot *slot;
     int error;
 };
+
+AWS_STATIC_STRING_FROM_LITERAL(s_tls_key_log_env_var, "AWS_CRT_EXPORT_TLS_KEYS");
 
 struct s2n_handler {
     struct aws_channel_handler handler;
@@ -97,6 +101,67 @@ struct aws_tls_key_operation {
 
     struct aws_atomic_var complete_count;
 };
+
+static aws_thread_once s_tls_key_log_warning_once = AWS_THREAD_ONCE_STATIC_INIT;
+
+static void s_emit_tls_key_log_warning(void *user_data) {
+    (void)user_data;
+    printf(
+        "\n\n===================================================");
+    printf(
+        "TLS key logging enabled via AWS_CRT_EXPORT_TLS_KEYS. Secrets will be emitted in NSS key log format.");
+    printf(
+        "===================================================\n\n");
+}
+
+static bool s_tls_ctx_should_log_keys(struct aws_allocator *allocator) {
+    struct aws_string *env_value = NULL;
+    bool enabled = false;
+
+    if (aws_get_environment_value(allocator, s_tls_key_log_env_var, &env_value) == AWS_OP_SUCCESS) {
+        if (env_value != NULL) {
+            struct aws_byte_cursor value_cursor = aws_byte_cursor_from_string(env_value);
+            if (value_cursor.len > 0 &&
+                !aws_byte_cursor_eq_c_str_ignore_case(&value_cursor, "0") &&
+                !aws_byte_cursor_eq_c_str_ignore_case(&value_cursor, "false") &&
+                !aws_byte_cursor_eq_c_str_ignore_case(&value_cursor, "off")) {
+                enabled = true;
+            }
+            aws_string_destroy(env_value);
+        }
+    }
+
+    return enabled;
+}
+
+static int s_s2n_key_log_callback(void *user_data, struct s2n_connection *conn, uint8_t *log_line, size_t len) {
+    (void)conn;
+
+    if (log_line == NULL || len == 0) {
+        return S2N_SUCCESS;
+    }
+
+    struct s2n_ctx *s2n_ctx = user_data;
+    if (s2n_ctx == NULL) {
+        AWS_LOGF_WARN(AWS_LS_IO_TLS, "TLS key log: missing TLS context for emitted secret.");
+        return S2N_SUCCESS;
+    }
+
+    struct aws_allocator *allocator = s2n_ctx->ctx.alloc;
+
+    struct aws_byte_cursor cursor = aws_byte_cursor_from_array(log_line, len);
+    struct aws_string *line_str = aws_string_new_from_cursor(allocator, &cursor);
+    if (line_str == NULL) {
+        AWS_LOGF_WARN(AWS_LS_IO_TLS, "TLS key log: failed to allocate buffer for emitted secret.");
+        return S2N_SUCCESS;
+    }
+
+    AWS_LOGF_INFO(AWS_LS_IO_TLS, "TLS key log: %s", (const char *)line_str->bytes);
+    fprintf(stderr, "%s\n", (const char *)line_str->bytes);
+    aws_string_destroy(line_str);
+
+    return S2N_SUCCESS;
+}
 
 AWS_STATIC_STRING_FROM_LITERAL(s_debian_path, "/etc/ssl/certs");
 AWS_STATIC_STRING_FROM_LITERAL(s_rhel_path, "/etc/pki/tls/certs");
@@ -1354,6 +1419,7 @@ static struct aws_tls_ctx *s_tls_ctx_new(
     struct aws_allocator *alloc,
     const struct aws_tls_ctx_options *options,
     s2n_mode mode) {
+    s_log_and_raise_s2n_errno("ASDF");
     struct s2n_ctx *s2n_ctx = aws_mem_calloc(alloc, 1, sizeof(struct s2n_ctx));
 
     if (!s2n_ctx) {
@@ -1386,6 +1452,17 @@ static struct aws_tls_ctx *s_tls_ctx_new(
     if (set_clock_result != S2N_ERR_T_OK) {
         s_log_and_raise_s2n_errno("ctx: failed to set monotonic clock");
         goto cleanup_s2n_config;
+    }
+
+    if (s_tls_ctx_should_log_keys(alloc)) {
+        if (s2n_config_set_key_log_cb(s2n_ctx->s2n_config, s_s2n_key_log_callback, s2n_ctx)) {
+            printf(
+                "\n\n\n\n\nctx: failed to enable TLS key logging: %s (%s)\n\n\n\n",
+                s2n_strerror(s2n_errno, "EN"),
+                s2n_strerror_debug(s2n_errno, "EN"));
+        } else {
+            aws_thread_call_once(&s_tls_key_log_warning_once, s_emit_tls_key_log_warning, NULL);
+        }
     }
 
     const char *security_policy = NULL;
