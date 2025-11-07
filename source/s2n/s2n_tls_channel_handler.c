@@ -1419,7 +1419,6 @@ static struct aws_tls_ctx *s_tls_ctx_new(
     struct aws_allocator *alloc,
     const struct aws_tls_ctx_options *options,
     s2n_mode mode) {
-    s_log_and_raise_s2n_errno("ASDF");
     struct s2n_ctx *s2n_ctx = aws_mem_calloc(alloc, 1, sizeof(struct s2n_ctx));
 
     if (!s2n_ctx) {
