@@ -280,6 +280,11 @@ static int s_socks5_proxy_options_basic(struct aws_allocator *allocator, void *c
     ASSERT_INT_EQUALS(3000, options.connection_timeout_ms);
     ASSERT_INT_EQUALS(AWS_SOCKS5_HOST_RESOLUTION_PROXY, options.host_resolution_mode);
 
+    struct aws_byte_cursor ipv6_proxy = aws_byte_cursor_from_c_str("[::1]");
+    aws_socks5_proxy_options_clean_up(&options);
+    ASSERT_SUCCESS(aws_socks5_proxy_options_init(&options, allocator, ipv6_proxy, 1080));
+    ASSERT_STR_EQUALS("::1", aws_string_c_str(options.host));
+
     struct aws_byte_cursor username = aws_byte_cursor_from_c_str("user");
     struct aws_byte_cursor password = aws_byte_cursor_from_c_str("pass");
     ASSERT_SUCCESS(aws_socks5_proxy_options_set_auth(&options, allocator, username, password));
@@ -327,6 +332,75 @@ static int s_socks5_infer_address_type_cases(struct aws_allocator *allocator, vo
     return AWS_OP_SUCCESS;
 }
 AWS_TEST_CASE(socks5_infer_address_type_cases, s_socks5_infer_address_type_cases)
+
+static int s_socks5_connect_request_ipv6_literals(struct aws_allocator *allocator, void *ctx) {
+
+    (void)ctx;
+
+    struct aws_socks5_proxy_options options;
+    AWS_ZERO_STRUCT(options);
+    struct aws_byte_cursor proxy_host = aws_byte_cursor_from_c_str("proxy.example.com");
+    ASSERT_SUCCESS(aws_socks5_proxy_options_init(&options, allocator, proxy_host, 1080));
+
+    /* Bracketed literal */
+    struct aws_socks5_context bracket_context;
+    AWS_ZERO_STRUCT(bracket_context);
+    struct aws_byte_cursor bracket_host = aws_byte_cursor_from_c_str("[2001:db8::1]");
+    ASSERT_SUCCESS(aws_socks5_context_init(
+        &bracket_context,
+        allocator,
+        &options,
+        bracket_host,
+        443,
+        AWS_SOCKS5_ATYP_DOMAIN));
+    bracket_context.state = AWS_SOCKS5_STATE_GREETING_RECEIVED;
+
+    struct aws_byte_buf buffer;
+    ASSERT_SUCCESS(aws_byte_buf_init(&buffer, allocator, 128));
+    ASSERT_SUCCESS(aws_socks5_write_connect_request(&bracket_context, &buffer));
+    ASSERT_UINT_EQUALS(6 + 16, buffer.len);
+    ASSERT_UINT_EQUALS(AWS_SOCKS5_ATYP_IPV6, buffer.buffer[3]);
+
+    uint8_t expected_ipv6[] = {0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+                               0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+    ASSERT_BIN_ARRAYS_EQUALS(expected_ipv6, sizeof(expected_ipv6), buffer.buffer + 4, 16);
+    ASSERT_UINT_EQUALS(0x01, buffer.buffer[4 + 16]);
+    ASSERT_UINT_EQUALS(0xbb, buffer.buffer[4 + 16 + 1]);
+
+    aws_byte_buf_clean_up(&buffer);
+    aws_socks5_context_clean_up(&bracket_context);
+
+    /* Scoped literal */
+    struct aws_socks5_context scoped_context;
+    AWS_ZERO_STRUCT(scoped_context);
+    struct aws_byte_cursor scoped_host = aws_byte_cursor_from_c_str("[fe80::1%25eth0]");
+    ASSERT_SUCCESS(aws_socks5_context_init(
+        &scoped_context,
+        allocator,
+        &options,
+        scoped_host,
+        8883,
+        AWS_SOCKS5_ATYP_DOMAIN));
+    scoped_context.state = AWS_SOCKS5_STATE_GREETING_RECEIVED;
+
+    ASSERT_SUCCESS(aws_byte_buf_init(&buffer, allocator, 128));
+    ASSERT_SUCCESS(aws_socks5_write_connect_request(&scoped_context, &buffer));
+    ASSERT_UINT_EQUALS(6 + 16, buffer.len);
+    ASSERT_UINT_EQUALS(AWS_SOCKS5_ATYP_IPV6, buffer.buffer[3]);
+
+    uint8_t expected_scoped[] = {0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+    ASSERT_BIN_ARRAYS_EQUALS(expected_scoped, sizeof(expected_scoped), buffer.buffer + 4, 16);
+    ASSERT_UINT_EQUALS(0x22, buffer.buffer[4 + 16]);
+    ASSERT_UINT_EQUALS(0xb3, buffer.buffer[4 + 16 + 1]);
+
+    aws_byte_buf_clean_up(&buffer);
+    aws_socks5_context_clean_up(&scoped_context);
+    aws_socks5_proxy_options_clean_up(&options);
+
+    return AWS_OP_SUCCESS;
+}
+AWS_TEST_CASE(socks5_connect_request_ipv6_literals, s_socks5_connect_request_ipv6_literals)
 
 static int s_socks5_context_init_lifecycle(struct aws_allocator *allocator, void *ctx) {
 
@@ -1210,3 +1284,66 @@ static int s_socks5_bootstrap_system_vtable_failure(struct aws_allocator *alloca
     return AWS_OP_SUCCESS;
 }
 AWS_TEST_CASE(socks5_bootstrap_system_vtable_failure, s_socks5_bootstrap_system_vtable_failure)
+
+static int s_socks5_bootstrap_ipv6_literal_normalization(struct aws_allocator *allocator, void *ctx) {
+
+    (void)ctx;
+    aws_io_library_init(allocator);
+
+    struct aws_event_loop_group *el_group = aws_event_loop_group_new_default(allocator, 1, NULL);
+    ASSERT_NOT_NULL(el_group);
+
+    struct aws_client_bootstrap_options bootstrap_options = {
+        .event_loop_group = el_group,
+        .host_resolver = NULL,
+    };
+    struct aws_client_bootstrap *client_bootstrap = aws_client_bootstrap_new(allocator, &bootstrap_options);
+    ASSERT_NOT_NULL(client_bootstrap);
+
+    struct aws_socket_options socket_options = {
+        .type = AWS_SOCKET_STREAM,
+        .domain = AWS_SOCKET_IPV6,
+        .connect_timeout_ms = 1000,
+    };
+
+    struct aws_socket_channel_bootstrap_options channel_options;
+    AWS_ZERO_STRUCT(channel_options);
+    channel_options.bootstrap = client_bootstrap;
+    channel_options.host_name = "target.example.com";
+    channel_options.port = 443;
+    channel_options.socket_options = &socket_options;
+
+    struct aws_socks5_proxy_options proxy_options;
+    ASSERT_SUCCESS(aws_socks5_proxy_options_init(
+        &proxy_options, allocator, aws_byte_cursor_from_c_str("[::1]"), 1080));
+
+    struct socks5_bootstrap_stub_context stub_context;
+    AWS_ZERO_STRUCT(stub_context);
+    stub_context.allocator = allocator;
+    s_stub_context = &stub_context;
+
+    struct aws_socks5_system_vtable stub_vtable = {
+        .aws_client_bootstrap_new_socket_channel = s_stub_bootstrap_new_socket_channel,
+    };
+    aws_socks5_channel_handler_set_system_vtable(&stub_vtable);
+
+    ASSERT_ERROR(
+        AWS_ERROR_UNKNOWN,
+        aws_client_bootstrap_new_socket_channel_with_socks5(allocator, &channel_options, &proxy_options));
+
+    ASSERT_TRUE(stub_context.invoked);
+    ASSERT_NOT_NULL(stub_context.host_name_copy);
+    ASSERT_STR_EQUALS("::1", aws_string_c_str(stub_context.host_name_copy));
+
+    aws_socks5_channel_handler_set_system_vtable(NULL);
+    s_stub_context = NULL;
+
+    aws_string_destroy(stub_context.host_name_copy);
+    aws_socks5_proxy_options_clean_up(&proxy_options);
+    aws_client_bootstrap_release(client_bootstrap);
+    aws_event_loop_group_release(el_group);
+    aws_io_library_clean_up();
+
+    return AWS_OP_SUCCESS;
+}
+AWS_TEST_CASE(socks5_bootstrap_ipv6_literal_normalization, s_socks5_bootstrap_ipv6_literal_normalization)
